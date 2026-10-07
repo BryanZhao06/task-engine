@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: engine_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: taskengine
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - engine-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: engine_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - engine-net
+
+  api:
+    build: .
+    command: /bin/api
+    container_name: engine_api
+    restart: on-failure
+    ports:
+      - "8080:8080"
+    environment:
+      PG_CONN: "postgres://user:password@postgres:5432/taskengine?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - engine-net
+
+  worker:
+    build: .
+    command: /bin/worker
+    container_name: engine_worker
+    restart: on-failure
+    environment:
+      PG_CONN: "postgres://user:password@postgres:5432/taskengine?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - engine-net
+
+volumes:
+  pgdata:
+
+networks:
+  engine-net:
+    driver: bridge
