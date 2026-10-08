@@ -121,8 +121,21 @@ func (s *TaskServer) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 
 	// Step B: Push task ID into Redis FIFO list
 	if err := queue.EnqueueTask(ctx, s.rdb, s.queueName, taskID.String()); err != nil {
-		log.Printf("Failed to enqueue task %s to Redis: %v", taskID, err)
-		http.Error(w, `{"error":"failed to dispatch task"}`, http.StatusInternalServerError)
+		log.Printf("Failed to enqueue task %s to Redis: %v. Initiating rollback in PostgreSQL...", taskID, err)
+
+		// Dual-write remediation: Compensate by deleting the orphaned task
+		// Use a detached timeout context to guarantee the cleanup query finishes even if the HTTP request was canceled
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cleanupCancel()
+
+		_, delErr := s.pool.Exec(cleanupCtx, "DELETE FROM tasks WHERE id = $1", taskID)
+		if delErr != nil {
+			log.Printf("CRITICAL: Failed to clean up orphaned task %s: %v", taskID, delErr)
+		} else {
+			log.Printf("Successfully removed orphaned task %s from PostgreSQL", taskID)
+		}
+
+		http.Error(w, `{"error":"failed to dispatch task to message broker"}`, http.StatusInternalServerError)
 		return
 	}
 

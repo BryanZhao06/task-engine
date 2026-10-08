@@ -73,6 +73,9 @@ func main() {
 		}(i)
 	}
 
+	// Launch the background outbox sweeper
+	go w.startOrphanTaskSweeper(ctx)
+
 	<-ctx.Done()
 	log.Println("Shutdown signal received. Finishing in-flight tasks...")
 	wg.Wait()
@@ -195,8 +198,13 @@ func (w *Worker) handleFailure(ctx context.Context, workerID int, taskUUID uuid.
 
 		// Wait out the backoff period and push back to Redis
 		go func() {
-			time.Sleep(backoffDuration)
-			_ = queue.EnqueueTask(context.Background(), w.rdb, w.queueName, taskIDStr)
+			select {
+			case <-ctx.Done():
+				// If system is shutting down, immediately push back to queue so it isn't lost
+				_ = queue.EnqueueTask(context.Background(), w.rdb, w.queueName, taskIDStr)
+			case <-time.After(backoffDuration):
+				_ = queue.EnqueueTask(context.Background(), w.rdb, w.queueName, taskIDStr)
+			}
 		}()
 		return
 	}
@@ -215,4 +223,39 @@ func (w *Worker) handleFailure(ctx context.Context, workerID int, taskUUID uuid.
 
 	// Push task ID to Dead-Letter Queue in Redis
 	_ = queue.EnqueueTask(ctx, w.rdb, w.dlqName, taskIDStr)
+}
+
+// startOrphanTaskSweeper periodically recovers tasks stuck in 'pending' for > 2 minutes
+func (w *Worker) startOrphanTaskSweeper(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Find tasks that were created > 2 minutes ago but never picked up
+			query := `
+				SELECT id 
+				FROM tasks 
+				WHERE status = 'pending' 
+				  AND created_at < NOW() - INTERVAL '2 minutes'
+				LIMIT 50;
+			`
+			rows, err := w.pool.Query(ctx, query)
+			if err != nil {
+				continue
+			}
+
+			for rows.Next() {
+				var id uuid.UUID
+				if err := rows.Scan(&id); err == nil {
+					log.Printf("[Sweeper] Recovering orphaned task %s and re-enqueuing to Redis", id)
+					_ = queue.EnqueueTask(ctx, w.rdb, w.queueName, id.String())
+				}
+			}
+			rows.Close()
+		}
+	}
 }

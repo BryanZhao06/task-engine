@@ -11,6 +11,12 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./migrations/001_create_tasks.sql:/docker-entrypoint-initdb.d/001_create_tasks.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d taskengine"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
     networks:
       - engine-net
 
@@ -34,8 +40,10 @@ services:
       PG_CONN: "postgres://user:password@postgres:5432/taskengine?sslmode=disable"
       REDIS_ADDR: "redis:6379"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     networks:
       - engine-net
 
@@ -48,8 +56,10 @@ services:
       PG_CONN: "postgres://user:password@postgres:5432/taskengine?sslmode=disable"
       REDIS_ADDR: "redis:6379"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     networks:
       - engine-net
 
