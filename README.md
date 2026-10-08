@@ -3,30 +3,15 @@
 A fault-tolerant, asynchronous background task processing engine built in Go, using Redis for high-throughput FIFO queuing and PostgreSQL for transactional state tracking.
 
 ## Architecture Overview
-
-                  +-------------------+
-                  |   Client (HTTP)   |
-                  +---------+---------+
-                            |
-                            v
-                  +-------------------+
-                  |  Producer API     |
-                  |  Gateway (Go)     |
-                  +----+---------+----+
-                       |         |
-  (1) Save State       |         | (2) Push Task ID
-                       v         v
-          +---------------+   +---------------+
-          |  PostgreSQL   |   |     Redis     |
-          | (State Store) |   | (Queue / DLQ) |
-          +---------------+   +-------+-------+
-                                      |
-                                      | (3) Blocking Pop (BRPOP)
-                                      v
-                            +-------------------+
-                            | Concurrent Worker |
-                            |   Fleet (Go)      |
-                            +-------------------+
+```mermaid
+flowchart TD
+    Client["Client (HTTP)"] -->|"POST /tasks"| API["Producer API Gateway (Go)"]
+    API -->|"(1) Save State"| Postgres[("PostgreSQL <br/> (State Machine)")]
+    API -->|"(2) Push Task ID"| Redis[("Redis <br/> (FIFO Queue)")]
+    Redis -->|"(3) Blocking Pop (BRPOP)"| Worker["Concurrent Worker Pool (Go)"]
+    Worker -->|"(4) Update Status & Retries"| Postgres
+    Worker -.->|"Max Retries Exceeded"| DLQ[("Dead-Letter Queue <br/> (Redis tasks:dlq)")]
+```
 
 ### Core Components
 * **Producer API Gateway (`cmd/api`)**: Accepts task requests via REST endpoints, persists task metadata in PostgreSQL with an initial `pending` state, and pushes the task ID to Redis with sub-10ms response latency.
@@ -55,6 +40,7 @@ cd task-engine
 
 # Start all services (PostgreSQL, Redis, API Gateway, Worker Engine)
 docker compose up --build -d
+```
 
 ## API Usage & Demo
 
@@ -68,8 +54,9 @@ curl -X POST http://localhost:8080/tasks \
     "task_type": "generate_report",
     "payload": {"report_id": 1042}
   }'
+```
 
-## Expected Response (202 Accepted)
+#### Expected Response (202 Accepted)
 ```json
 {
   "id": "e3b0c442-98fc-1c14-9afb-4c8996fb9242",
@@ -84,13 +71,16 @@ curl -X POST http://localhost:8080/tasks \
   "updated_at": "2026-10-07T16:20:00Z"
 }
 
+```
+
 ### 2. Poll Task Execution Status
 Query PostgreSQL via the API to inspect the lifecycle transition (pending -> running -> completed / failed).
 
 ```bash
 curl http://localhost:8080/tasks/e3b0c442-98fc-1c14-9afb-4c8996fb9242
+```
 
-## Expected Response (200 OK)
+#### Expected Response (200 OK)
 ```json
 {
   "id": "e3b0c442-98fc-1c14-9afb-4c8996fb9242",
@@ -104,3 +94,67 @@ curl http://localhost:8080/tasks/e3b0c442-98fc-1c14-9afb-4c8996fb9242
   "created_at": "2026-10-07T16:20:00Z",
   "updated_at": "2026-10-07T16:20:02Z"
 }
+```
+
+### 3. Testing Fault Tolerance & DLQ
+Dispatch an intentionally failing task to observe exponential backoff ($2^{n-1}$ seconds) and DLQ routing:
+
+```bash
+curl -X POST http://localhost:8080/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"task_type": "failing_task", "payload": {"test": true}}'
+```
+
+* **Attempt 1:** Fails immediately $\rightarrow$ Re-queued after a 1-second backoff.
+* **Attempt 2:** Fails $\rightarrow$ Re-queued after a 2-second backoff.
+* **Attempt 3:** Exceeds `max_retries` $\rightarrow$ Updated to `status: failed` in PostgreSQL and routed to Redis list `tasks:dlq`.
+
+## Database Schema & State Machine
+
+Workflows transition strictly through an atomic state machine tracked in PostgreSQL:
+
+```
+[ pending ] ──(Worker Claims)──> [ running ] ──(Success)──> [ completed ]
+                                      │
+                                (Job Failure)
+                                      │
+                     ┌────────────────┴────────────────┐
+                     ▼                                 ▼
+             (attempts < max)                  (attempts >= max)
+                     │                                 │
+                     ▼                                 ▼
+              [ pending ] (Retry)                [ failed ] ──> (DLQ)
+```
+
+### Table Schema (`tasks`)
+* `id` (`UUID`): Primary key, generated via `gen_random_uuid()`.
+* `task_type` (`VARCHAR(64)`): Identifier for the task worker handler.
+* `payload` (`JSONB`): Arbitrary task metadata and parameters.
+* `status` (`task_status ENUM`): State restricted to `'pending'`, `'running'`, `'completed'`, or `'failed'`.
+* `attempts` / `max_retries` (`INT`): Counters tracking execution retries.
+* `error_message` (`TEXT`): Diagnostic output for failures.
+* **Partial Index**: Indexed on `(status, created_at) WHERE status = 'pending'` for efficient worker polling without table scans.
+
+## Engineering Highlights & Design Decisions
+
+* **Decoupled Architecture:** Using Redis solely as a lightweight FIFO transit broker preserves in-memory throughput, while PostgreSQL handles durable persistence, queryability, and auditability.
+* **Atomic State Claiming:** Workers claim tasks via `UPDATE tasks SET status = 'running', attempts = attempts + 1 WHERE id = $1 AND (status = 'pending' OR status = 'running') RETURNING ...`, eliminating race conditions between concurrent goroutines.
+* **Non-Blocking Ingestion:** The HTTP API gateway offloads heavy workloads immediately, returning `202 Accepted` in sub-10ms.
+* **Graceful Worker Shutdown:** Intercepts `os.Interrupt` and `SIGTERM` signals via Go context cancellation and coordinates in-flight task completion with `sync.WaitGroup`, preventing data corruption or orphaned running states on deployment restarts.
+* **Multi-Stage Container Builds:** Statically compiles lightweight Linux binaries on Alpine base images, reducing final image footprint to under 20MB.
+
+## Project Structure
+
+```text
+├── cmd/
+│   ├── api/             # HTTP API Gateway (Task Producer)
+│   └── worker/          # Background Consumer Fleet & Goroutine Pool
+├── internal/
+│   ├── db/              # PostgreSQL connection pool initialization (pgx/v5)
+│   └── queue/           # Redis queue operations & DLQ dispatcher (go-redis)
+├── migrations/
+│   └── 001_create_tasks.sql # Database schema, enums, and partial indexes
+├── docker-compose.yml   # Multi-container orchestration (App, Worker, Postgres, Redis)
+├── Dockerfile           # Optimized multi-stage Go build
+└── go.mod
+```
