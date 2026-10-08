@@ -35,10 +35,18 @@ flowchart TD
 ### Running the Cluster
 ```bash
 # Clone the repository
-git clone [https://github.com/BryanZhao06/task-engine.git](https://github.com/BryanZhao06/task-engine.git)
+git clone https://github.com/BryanZhao06/task-engine.git
 cd task-engine
 
 # Start all services (PostgreSQL, Redis, API Gateway, Worker Engine)
+docker compose up --build -d
+```
+
+> **Troubleshooting / Clean Rebuild:**
+> 
+> If PostgreSQL volumes were previously created before initialization scripts were mounted, reset your local volume to execute the fresh migration:
+```bash
+docker compose down -v
 docker compose up --build -d
 ```
 
@@ -56,7 +64,13 @@ curl -X POST http://localhost:8080/tasks \
   }'
 ```
 
-#### Expected Response (202 Accepted)
+#### PowerShell Alternative
+```powershell
+$body = @{ task_type = "generate_report"; payload = @{ report_id = 1042 } } | ConvertTo-Json
+$res = Invoke-RestMethod -Uri "http://localhost:8080/tasks" -Method Post -Body $body -ContentType "application/json"
+$res
+```
+#### Expected Response (`202 Accepted`)
 ```json
 {
   "id": "e3b0c442-98fc-1c14-9afb-4c8996fb9242",
@@ -70,17 +84,25 @@ curl -X POST http://localhost:8080/tasks \
   "created_at": "2026-10-07T16:20:00Z",
   "updated_at": "2026-10-07T16:20:00Z"
 }
-
 ```
 
 ### 2. Poll Task Execution Status
 Query PostgreSQL via the API to inspect the lifecycle transition (pending -> running -> completed / failed).
 
 ```bash
-curl http://localhost:8080/tasks/e3b0c442-98fc-1c14-9afb-4c8996fb9242
+TASK_ID=$(curl -s -X POST http://localhost:8080/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"task_type": "generate_report", "payload": {"report_id": 1042}}' | grep -o '"id":"[^"]*' | cut -d'"' -f4)
+
+curl http://localhost:8080/tasks/$TASK_ID
 ```
 
-#### Expected Response (200 OK)
+#### PowerShell Alternative
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/tasks/$($res.id)" -Method Get
+```
+
+#### Expected Response (`200 OK`)
 ```json
 {
   "id": "e3b0c442-98fc-1c14-9afb-4c8996fb9242",
@@ -98,16 +120,26 @@ curl http://localhost:8080/tasks/e3b0c442-98fc-1c14-9afb-4c8996fb9242
 
 ### 3. Testing Fault Tolerance & DLQ
 Dispatch an intentionally failing task to observe exponential backoff ($2^{n-1}$ seconds) and DLQ routing:
-
 ```bash
 curl -X POST http://localhost:8080/tasks \
   -H "Content-Type: application/json" \
   -d '{"task_type": "failing_task", "payload": {"test": true}}'
 ```
 
+#### PowerShell Alternative
+```powershell
+$failBody = @{ task_type = "failing_task"; payload = @{ test = $true } } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://localhost:8080/tasks" -Method Post -Body $failBody -ContentType "application/json"
+```
+
 * **Attempt 1:** Fails immediately $\rightarrow$ Re-queued after a 1-second backoff.
 * **Attempt 2:** Fails $\rightarrow$ Re-queued after a 2-second backoff.
-* **Attempt 3:** Exceeds `max_retries` $\rightarrow$ Updated to `status: failed` in PostgreSQL and routed to Redis list `tasks:dlq`.
+* **Attempt 3:** Exceeds `max_retries` $\rightarrow$ Updated to `status: failed` in PostgreSQL and routed to the Dead Letter Queue `tasks:dlq`.
+
+After ~7 seconds, verify the poisoned task ID landed in the Redis Dead-Letter Queue:
+```bash
+docker exec -it engine_redis redis-cli LRANGE tasks:dlq 0 -1
+```
 
 ## Database Schema & State Machine
 
@@ -142,6 +174,7 @@ Workflows transition strictly through an atomic state machine tracked in Postgre
 * **Non-Blocking Ingestion:** The HTTP API gateway offloads heavy workloads immediately, returning `202 Accepted` in sub-10ms.
 * **Graceful Worker Shutdown:** Intercepts `os.Interrupt` and `SIGTERM` signals via Go context cancellation and coordinates in-flight task completion with `sync.WaitGroup`, preventing data corruption or orphaned running states on deployment restarts.
 * **Multi-Stage Container Builds:** Statically compiles lightweight Linux binaries on Alpine base images, reducing final image footprint to under 20MB.
+* **Dual-Write Consistency & Orphan Sweeper:** Solves producer dual-write anomalies by triggering an immediate compensating PostgreSQL rollback if Redis enqueuing fails. Includes a background sweeper goroutine that periodically queries and re-enqueues orphaned pending tasks if an API node experiences a hard crash mid-dispatch.
 
 ## Project Structure
 
@@ -159,3 +192,12 @@ Workflows transition strictly through an atomic state machine tracked in Postgre
 ├── go.sum
 └── go.mod
 ```
+
+## Configuration
+
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `PG_CONN` | `postgres://user:password@localhost:5432/taskengine?sslmode=disable` | PostgreSQL connection pool DSN |
+| `REDIS_ADDR` | `localhost:6379` | Host and port for Redis broker & DLQ |
+| `PORT` | `8080` | HTTP port for the Producer API Gateway |
+| `WORKER_CONCURRENCY` | `5` | Number of parallel worker Goroutines spawned |
