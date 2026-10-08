@@ -156,5 +156,6 @@ Workflows transition strictly through an atomic state machine tracked in Postgre
 │   └── 001_create_tasks.sql # Database schema, enums, and partial indexes
 ├── docker-compose.yml   # Multi-container orchestration (App, Worker, Postgres, Redis)
 ├── Dockerfile           # Optimized multi-stage Go build
+├── go.sum
 └── go.mod
 ```
